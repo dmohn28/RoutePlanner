@@ -1,11 +1,14 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
-import { useEffect, useState } from "react";
+import { extractTextFromImage } from "expo-text-extractor";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   Linking,
+  Platform,
   StyleSheet,
   Switch,
   Text,
@@ -43,12 +46,14 @@ const STATUS_COLORS: Record<StopStatus, string> = {
   failed: "#e74c3c",
 };
 
-const STATUS_ORDER: StopStatus[] = [
-  "pending",
-  "completed",
-  "skipped",
-  "failed",
-];
+const STATUS_ORDER: StopStatus[] = ["pending", "completed", "skipped", "failed"];
+
+// On iOS we use Apple's free built-in maps for the in-app pin view. Android
+// has no equivalent free map, and Google's Maps SDK requires an API key —
+// so on Android we skip the in-app map entirely and just show the ordered
+// stop list, relying on the Google Maps app handoff for the visual/driving
+// part instead.
+const SHOW_IN_APP_MAP = Platform.OS === "ios";
 
 export default function HomeScreen() {
   const [address, setAddress] = useState("");
@@ -56,20 +61,25 @@ export default function HomeScreen() {
   const [markers, setMarkers] = useState<Coordinate[]>([]);
   const [startLocation, setStartLocation] = useState<Coordinate | null>(null);
   const [roundTrip, setRoundTrip] = useState(false);
-  const [navApp, setNavApp] = useState<"apple" | "google">("apple");
-  const [showMap, setShowMap] = useState(false);
+  const [navApp, setNavApp] = useState<"apple" | "google">(
+    Platform.OS === "android" ? "google" : "apple"
+  );
+  const [showResults, setShowResults] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [suggestions, setSuggestions] = useState<{ display_name: string }[]>(
-    [],
+    []
   );
   const [routeStarted, setRouteStarted] = useState(false);
   const [currentStopIndex, setCurrentStopIndex] = useState(0);
+  const [showCamera, setShowCamera] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const cameraRef = useRef<CameraView>(null);
 
   const STORAGE_KEY = "route-planner-stops-v2";
   const NAV_APP_KEY = "route-planner-nav-app";
 
-  // Load saved stops when the app starts
   useEffect(() => {
     async function loadStops() {
       try {
@@ -84,7 +94,12 @@ export default function HomeScreen() {
     loadStops();
   }, []);
 
-  // Load saved navigation app preference
+  useEffect(() => {
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(stops)).catch((e) =>
+      console.log("Failed to save stops:", e)
+    );
+  }, [stops]);
+
   useEffect(() => {
     async function loadNavApp() {
       try {
@@ -99,21 +114,12 @@ export default function HomeScreen() {
     loadNavApp();
   }, []);
 
-  // Save navigation app preference whenever it changes
   useEffect(() => {
     AsyncStorage.setItem(NAV_APP_KEY, navApp).catch((e) =>
-      console.log("Failed to save nav app preference:", e),
+      console.log("Failed to save nav app preference:", e)
     );
   }, [navApp]);
 
-  // Save stops every time they change
-  useEffect(() => {
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(stops)).catch((e) =>
-      console.log("Failed to save stops:", e),
-    );
-  }, [stops]);
-
-  // Address autocomplete via Nominatim (debounced)
   useEffect(() => {
     if (address.trim().length < 3) {
       setSuggestions([]);
@@ -124,8 +130,8 @@ export default function HomeScreen() {
       try {
         const response = await fetch(
           `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
-            address,
-          )}&limit=5`,
+            address
+          )}&limit=5`
         );
         const data = await response.json();
         setSuggestions(data);
@@ -148,6 +154,38 @@ export default function HomeScreen() {
     setAddress("");
   }
 
+  async function openScanner() {
+    if (!cameraPermission?.granted) {
+      const result = await requestCameraPermission();
+      if (!result.granted) {
+        setErrorMsg("Camera permission is needed to scan addresses.");
+        return;
+      }
+    }
+    setShowCamera(true);
+  }
+
+  async function capturePhoto() {
+    if (!cameraRef.current) return;
+    setScanning(true);
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ base64: false });
+      if (photo?.uri) {
+        const detectedLines = await extractTextFromImage(photo.uri);
+        // Join detected lines of text into one editable string — the user
+        // can clean it up before adding it as a stop, since OCR results
+        // aren't always perfectly formatted.
+        const joined = (detectedLines ?? []).join(", ");
+        setAddress(joined);
+      }
+    } catch (e) {
+      console.log("Text scan error:", e);
+      setErrorMsg("Couldn't read text from that photo — try again.");
+    }
+    setScanning(false);
+    setShowCamera(false);
+  }
+
   function deleteStop(id: string) {
     setStops(stops.filter((s) => s.id !== id));
   }
@@ -166,10 +204,9 @@ export default function HomeScreen() {
       stops.map((s) => {
         if (s.id !== id) return s;
         const currentIndex = STATUS_ORDER.indexOf(s.status);
-        const nextStatus =
-          STATUS_ORDER[(currentIndex + 1) % STATUS_ORDER.length];
+        const nextStatus = STATUS_ORDER[(currentIndex + 1) % STATUS_ORDER.length];
         return { ...s, status: nextStatus };
-      }),
+      })
     );
   }
 
@@ -192,27 +229,35 @@ export default function HomeScreen() {
             setMarkers([]);
             setStartLocation(null);
             setErrorMsg("");
-            setShowMap(false);
+            setShowResults(false);
             setRouteStarted(false);
           },
         },
-      ],
+      ]
     );
   }
 
   async function optimizeAndShow() {
     const pendingStops = stops.filter((s) => s.status === "pending");
     if (pendingStops.length === 0) {
-      setErrorMsg(
-        "No pending stops to route — mark some back to pending first.",
-      );
+      setErrorMsg("No pending stops to route — mark some back to pending first.");
       return;
     }
     setLoading(true);
     setErrorMsg("");
 
     try {
-      // Step 1: Geocode every pending stop's address into coordinates
+      // Android requires location permission granted before geocoding will
+      // work at all, even for simple address-to-coordinate lookups. iOS
+      // doesn't need this for geocoding itself, but requesting it is
+      // harmless there too.
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        setErrorMsg("Location permission is needed to look up addresses.");
+        setLoading(false);
+        return;
+      }
+
       const geocoded: Coordinate[] = [];
       for (const stop of pendingStops) {
         const result = await Location.geocodeAsync(stop.address);
@@ -227,15 +272,8 @@ export default function HomeScreen() {
         }
       }
 
-      // Step 2: If round trip is on, get the device's current GPS location
       let anchor: Coordinate | null = null;
       if (roundTrip) {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          setErrorMsg("Location permission is needed for round trip.");
-          setLoading(false);
-          return;
-        }
         const position = await Location.getCurrentPositionAsync({});
         anchor = {
           id: "start-anchor",
@@ -251,12 +289,11 @@ export default function HomeScreen() {
       if (allPoints.length < 2) {
         setMarkers(geocoded);
         setStartLocation(anchor);
-        setShowMap(true);
+        setShowResults(true);
         setLoading(false);
         return;
       }
 
-      // Step 3: Ask OSRM for the best order to visit these stops.
       const coordsParam = allPoints
         .map((m) => `${m.longitude},${m.latitude}`)
         .join(";");
@@ -284,14 +321,12 @@ export default function HomeScreen() {
           : ordered;
 
         const optimizedMarkers = filteredOrder.map((i: number) =>
-          anchor ? geocoded[i - 1] : geocoded[i],
+          anchor ? geocoded[i - 1] : geocoded[i]
         );
 
-        // Reorder the visible stop list: optimized pending stops first (in
-        // their new order), followed by any non-pending stops, unchanged.
         const nonPending = stops.filter((s) => s.status !== "pending");
         const reorderedPending = optimizedMarkers.map(
-          (m) => stops.find((s) => s.id === m.id)!,
+          (m) => stops.find((s) => s.id === m.id)!
         );
         setStops([...reorderedPending, ...nonPending]);
         setMarkers(optimizedMarkers);
@@ -302,7 +337,7 @@ export default function HomeScreen() {
         setErrorMsg("Couldn't optimize order, showing original order.");
       }
 
-      setShowMap(true);
+      setShowResults(true);
     } catch (e) {
       console.log("Optimization error:", e);
       setErrorMsg("Something went wrong. Check your internet connection.");
@@ -315,33 +350,22 @@ export default function HomeScreen() {
     if (navApp === "google") {
       const url = `comgooglemaps://?daddr=${marker.latitude},${marker.longitude}&directionsmode=driving`;
       Linking.openURL(url).catch(() => {
-        // Google Maps app isn't installed or the scheme failed — fall back
-        // to the Google Maps website, which opens fine in Safari.
         Linking.openURL(
-          `https://maps.google.com/?daddr=${marker.latitude},${marker.longitude}`,
+          `https://maps.google.com/?daddr=${marker.latitude},${marker.longitude}`
         );
       });
     } else {
       const url = `maps://app?daddr=${marker.latitude},${marker.longitude}&dirflg=d`;
       Linking.openURL(url).catch(() => {
         Linking.openURL(
-          `https://maps.google.com/?daddr=${marker.latitude},${marker.longitude}`,
+          `https://maps.google.com/?daddr=${marker.latitude},${marker.longitude}`
         );
       });
     }
   }
 
-  // The full walking order for "Start Route" mode: all pending address
-  // stops, plus a final leg back to the starting point if round trip is on.
   const routeSequence: Coordinate[] = startLocation
-    ? [
-        ...markers,
-        {
-          ...startLocation,
-          id: "return-anchor",
-          address: "Back to Starting Location",
-        },
-      ]
+    ? [...markers, { ...startLocation, id: "return-anchor", address: "Back to Starting Location" }]
     : markers;
 
   function startRoute() {
@@ -353,12 +377,7 @@ export default function HomeScreen() {
 
   function advanceRoute(status: StopStatus) {
     const current = routeSequence[currentStopIndex];
-    // Only real stops (not the start/return anchor) carry a status
-    if (
-      current &&
-      current.id !== "start-anchor" &&
-      current.id !== "return-anchor"
-    ) {
+    if (current && current.id !== "start-anchor" && current.id !== "return-anchor") {
       setStopStatus(current.id, status);
     }
 
@@ -381,10 +400,10 @@ export default function HomeScreen() {
               setMarkers([]);
               setStartLocation(null);
               setErrorMsg("");
-              setShowMap(false);
+              setShowResults(false);
             },
           },
-        ],
+        ]
       );
     }
   }
@@ -395,18 +414,111 @@ export default function HomeScreen() {
 
   const pendingCount = stops.filter((s) => s.status === "pending").length;
 
-  if (showMap) {
+  if (showCamera) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <CameraView ref={cameraRef} style={styles.camera} facing="back">
+          <View style={styles.cameraOverlay}>
+            <Text style={styles.cameraHint}>
+              Frame the address, then tap to scan
+            </Text>
+            <View style={styles.cameraControls}>
+              <TouchableOpacity
+                style={styles.cameraCancelButton}
+                onPress={() => setShowCamera(false)}
+              >
+                <Text style={styles.cameraCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.captureButton}
+                onPress={capturePhoto}
+                disabled={scanning}
+              >
+                {scanning ? (
+                  <ActivityIndicator color="white" />
+                ) : (
+                  <View style={styles.captureButtonInner} />
+                )}
+              </TouchableOpacity>
+              <View style={styles.cameraCancelButton} />
+            </View>
+          </View>
+        </CameraView>
+      </SafeAreaView>
+    );
+  }
+
+  // Shared active-route control panel — used as a floating card over the
+  // map on iOS, and as a standalone panel on Android.
+  function ActiveRouteCard() {
+    return (
+      <View style={styles.activeRouteCard}>
+        <Text style={styles.activeRouteProgress}>
+          Stop {currentStopIndex + 1} of {routeSequence.length}
+        </Text>
+        <Text style={styles.activeRouteAddress} numberOfLines={2}>
+          {routeSequence[currentStopIndex]?.address}
+        </Text>
+        <View style={styles.activeRouteButtons}>
+          <TouchableOpacity
+            style={styles.skipButton}
+            onPress={() => advanceRoute("skipped")}
+          >
+            <Text style={styles.skipButtonText}>Skip</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.failedButton}
+            onPress={() => advanceRoute("failed")}
+          >
+            <Text style={styles.failedButtonText}>Failed</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.completeButton}
+            onPress={() => advanceRoute("completed")}
+          >
+            <Text style={styles.completeButtonText}>
+              {currentStopIndex + 1 === routeSequence.length
+                ? "Finish"
+                : "Complete"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity
+          style={styles.navigateAgainButton}
+          onPress={() => navigateToStop(routeSequence[currentStopIndex])}
+        >
+          <Text style={styles.navigateAgainText}>Navigate Again</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={endRoute}
+          style={styles.endRouteButton}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Text style={styles.endRouteText}>End Route</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (showResults) {
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.mapHeader}>
-          <TouchableOpacity onPress={() => setShowMap(false)}>
+          <TouchableOpacity onPress={() => setShowResults(false)}>
             <Text style={styles.backButton}>← Back to list</Text>
           </TouchableOpacity>
           {!routeStarted && (
             <>
               <Text style={styles.hint}>
-                Tap a pin for a single stop, or start the full route below
+                {SHOW_IN_APP_MAP
+                  ? "Tap a pin for a single stop, or start the full route below"
+                  : "Your optimized stop order — start the route below"}
               </Text>
+              {startLocation && (
+                <Text style={styles.hint}>
+                  Route starts and ends near your current location
+                </Text>
+              )}
               {routeSequence.length > 0 && (
                 <TouchableOpacity
                   style={styles.fullRouteButton}
@@ -418,104 +530,86 @@ export default function HomeScreen() {
             </>
           )}
         </View>
-        <MapView
-          style={styles.map}
-          initialRegion={{
-            latitude:
-              startLocation?.latitude ?? markers[0]?.latitude ?? 37.78825,
-            longitude:
-              startLocation?.longitude ?? markers[0]?.longitude ?? -122.4324,
-            latitudeDelta: 0.1,
-            longitudeDelta: 0.1,
-          }}
-        >
-          {startLocation && (
-            <Marker
-              coordinate={{
-                latitude: startLocation.latitude,
-                longitude: startLocation.longitude,
-              }}
-              title="Start / End"
-              description="Your starting location"
-            >
-              <View style={styles.startPin}>
-                <Text style={styles.startPinText}>S</Text>
-              </View>
-            </Marker>
-          )}
 
-          {markers.map((marker, index) => (
-            <Marker
-              key={marker.id}
-              coordinate={{
-                latitude: marker.latitude,
-                longitude: marker.longitude,
-              }}
-              title={`Stop ${index + 1}`}
-              description={marker.address}
-              onCalloutPress={() => navigateToStop(marker)}
-            >
-              <View
-                style={[
-                  styles.numberedPin,
-                  routeStarted &&
-                    index === currentStopIndex &&
-                    styles.numberedPinActive,
-                ]}
+        {SHOW_IN_APP_MAP ? (
+          <MapView
+            style={styles.map}
+            initialRegion={{
+              latitude: startLocation?.latitude ?? markers[0]?.latitude ?? 37.78825,
+              longitude:
+                startLocation?.longitude ?? markers[0]?.longitude ?? -122.4324,
+              latitudeDelta: 0.1,
+              longitudeDelta: 0.1,
+            }}
+          >
+            {startLocation && (
+              <Marker
+                coordinate={{
+                  latitude: startLocation.latitude,
+                  longitude: startLocation.longitude,
+                }}
+                title="Start / End"
+                description="Your starting location"
               >
-                <Text style={styles.numberedPinText}>{index + 1}</Text>
-              </View>
-            </Marker>
-          ))}
-        </MapView>
+                <View style={styles.startPin}>
+                  <Text style={styles.startPinText}>S</Text>
+                </View>
+              </Marker>
+            )}
 
-        {routeStarted && (
-          <View style={styles.activeRouteCard}>
-            <Text style={styles.activeRouteProgress}>
-              Stop {currentStopIndex + 1} of {routeSequence.length}
-            </Text>
-            <Text style={styles.activeRouteAddress} numberOfLines={2}>
-              {routeSequence[currentStopIndex]?.address}
-            </Text>
-            <View style={styles.activeRouteButtons}>
-              <TouchableOpacity
-                style={styles.skipButton}
-                onPress={() => advanceRoute("skipped")}
+            {markers.map((marker, index) => (
+              <Marker
+                key={marker.id}
+                coordinate={{
+                  latitude: marker.latitude,
+                  longitude: marker.longitude,
+                }}
+                title={`Stop ${index + 1}`}
+                description={marker.address}
+                onCalloutPress={() => navigateToStop(marker)}
               >
-                <Text style={styles.skipButtonText}>Skip</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.failedButton}
-                onPress={() => advanceRoute("failed")}
-              >
-                <Text style={styles.failedButtonText}>Failed</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.completeButton}
-                onPress={() => advanceRoute("completed")}
-              >
-                <Text style={styles.completeButtonText}>
-                  {currentStopIndex + 1 === routeSequence.length
-                    ? "Finish"
-                    : "Complete"}
+                <View
+                  style={[
+                    styles.numberedPin,
+                    routeStarted &&
+                      index === currentStopIndex &&
+                      styles.numberedPinActive,
+                  ]}
+                >
+                  <Text style={styles.numberedPinText}>{index + 1}</Text>
+                </View>
+              </Marker>
+            ))}
+          </MapView>
+        ) : (
+          <FlatList
+            data={markers}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.resultsListContent}
+            renderItem={({ item, index }) => (
+              <View style={styles.resultRow}>
+                <View
+                  style={[
+                    styles.resultNumber,
+                    routeStarted &&
+                      index === currentStopIndex &&
+                      styles.resultNumberActive,
+                  ]}
+                >
+                  <Text style={styles.resultNumberText}>{index + 1}</Text>
+                </View>
+                <Text style={styles.resultAddress} numberOfLines={2}>
+                  {item.address}
                 </Text>
-              </TouchableOpacity>
-            </View>
-            <TouchableOpacity
-              style={styles.navigateAgainButton}
-              onPress={() => navigateToStop(routeSequence[currentStopIndex])}
-            >
-              <Text style={styles.navigateAgainText}>Navigate Again</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={endRoute}
-              style={styles.endRouteButton}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            >
-              <Text style={styles.endRouteText}>End Route</Text>
-            </TouchableOpacity>
-          </View>
+                <TouchableOpacity onPress={() => navigateToStop(item)}>
+                  <Text style={styles.resultNavLink}>Navigate</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          />
         )}
+
+        {routeStarted && <ActiveRouteCard />}
       </SafeAreaView>
     );
   }
@@ -541,6 +635,9 @@ export default function HomeScreen() {
           value={address}
           onChangeText={setAddress}
         />
+        <TouchableOpacity style={styles.scanButton} onPress={openScanner}>
+          <Text style={styles.scanButtonText}>📷</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.button} onPress={addStop}>
           <Text style={styles.buttonText}>Add</Text>
         </TouchableOpacity>
@@ -631,43 +728,45 @@ export default function HomeScreen() {
 
       {errorMsg !== "" && <Text style={styles.error}>{errorMsg}</Text>}
 
-      <View style={styles.navAppRow}>
-        <Text style={styles.roundTripLabel}>Navigate using</Text>
-        <View style={styles.segmentedControl}>
-          <TouchableOpacity
-            style={[
-              styles.segmentButton,
-              navApp === "apple" && styles.segmentButtonActive,
-            ]}
-            onPress={() => setNavApp("apple")}
-          >
-            <Text
+      {SHOW_IN_APP_MAP && (
+        <View style={styles.navAppRow}>
+          <Text style={styles.roundTripLabel}>Navigate using</Text>
+          <View style={styles.segmentedControl}>
+            <TouchableOpacity
               style={[
-                styles.segmentButtonText,
-                navApp === "apple" && styles.segmentButtonTextActive,
+                styles.segmentButton,
+                navApp === "apple" && styles.segmentButtonActive,
               ]}
+              onPress={() => setNavApp("apple")}
             >
-              Apple Maps
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[
-              styles.segmentButton,
-              navApp === "google" && styles.segmentButtonActive,
-            ]}
-            onPress={() => setNavApp("google")}
-          >
-            <Text
+              <Text
+                style={[
+                  styles.segmentButtonText,
+                  navApp === "apple" && styles.segmentButtonTextActive,
+                ]}
+              >
+                Apple Maps
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
               style={[
-                styles.segmentButtonText,
-                navApp === "google" && styles.segmentButtonTextActive,
+                styles.segmentButton,
+                navApp === "google" && styles.segmentButtonActive,
               ]}
+              onPress={() => setNavApp("google")}
             >
-              Google Maps
-            </Text>
-          </TouchableOpacity>
+              <Text
+                style={[
+                  styles.segmentButtonText,
+                  navApp === "google" && styles.segmentButtonTextActive,
+                ]}
+              >
+                Google Maps
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
+      )}
 
       <View style={styles.roundTripRow}>
         <Text style={styles.roundTripLabel}>
@@ -714,6 +813,57 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   buttonText: { color: "white", fontWeight: "600" },
+  scanButton: {
+    backgroundColor: "#f0f0f0",
+    borderRadius: 8,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 12,
+  },
+  scanButtonText: { fontSize: 18 },
+  camera: { flex: 1 },
+  cameraOverlay: {
+    flex: 1,
+    justifyContent: "flex-end",
+    backgroundColor: "transparent",
+  },
+  cameraHint: {
+    color: "white",
+    textAlign: "center",
+    fontSize: 14,
+    marginBottom: 24,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    padding: 8,
+    marginHorizontal: 40,
+    borderRadius: 8,
+  },
+  cameraControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 24,
+    paddingBottom: 40,
+  },
+  cameraCancelButton: {
+    width: 70,
+  },
+  cameraCancelText: { color: "white", fontSize: 16, fontWeight: "600" },
+  captureButton: {
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: "rgba(255,255,255,0.3)",
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 3,
+    borderColor: "white",
+  },
+  captureButtonInner: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: "white",
+  },
   pendingSummary: {
     color: "#666",
     fontSize: 13,
@@ -851,6 +1001,31 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   fullRouteButtonText: { color: "white", fontWeight: "600" },
+  resultsListContent: {
+    padding: 16,
+  },
+  resultRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#eee",
+    gap: 10,
+  },
+  resultNumber: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#208AEF",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  resultNumberActive: {
+    backgroundColor: "#e74c3c",
+  },
+  resultNumberText: { color: "white", fontWeight: "bold", fontSize: 13 },
+  resultAddress: { fontSize: 15, flex: 1 },
+  resultNavLink: { color: "#208AEF", fontWeight: "600", fontSize: 13 },
   activeRouteCard: {
     position: "absolute",
     bottom: 0,
