@@ -39,6 +39,52 @@ function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
+// Common street-name suffixes, used to help identify which line of scanned
+// text is actually a street address versus other text in the photo.
+const STREET_SUFFIXES =
+  /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|way|ct|court|pl|place|cir|circle|pkwy|parkway|hwy|highway|trail|ter|terrace|sq|square)\b/i;
+
+// Matches a "City, ST 12345" style line.
+const CITY_STATE_ZIP = /,\s*[A-Za-z .]+,?\s*[A-Z]{2}\s*\d{5}(-\d{4})?\b/;
+
+// Matches a line starting with a street number, e.g. "123 Main St".
+const STREET_LINE = /^\d{1,6}\s+\S+/;
+
+function extractAddressFromLines(rawLines: string[]): string {
+  const lines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length === 0) return "";
+
+  // Score each line by how "address-like" it looks.
+  const scored = lines.map((line, index) => {
+    let score = 0;
+    if (STREET_LINE.test(line)) score += 3;
+    if (STREET_SUFFIXES.test(line)) score += 2;
+    if (CITY_STATE_ZIP.test(line)) score += 3;
+    if (/\d{5}/.test(line)) score += 1;
+    return { line, index, score };
+  });
+
+  const best = scored.reduce((a, b) => (b.score > a.score ? b : a));
+
+  // If the best line looks like a street address, check whether the very
+  // next line looks like a city/state/zip line — if so, combine them.
+  if (best.score > 0) {
+    const next = scored[best.index + 1];
+    if (
+      next &&
+      (CITY_STATE_ZIP.test(next.line) || /\d{5}/.test(next.line)) &&
+      !CITY_STATE_ZIP.test(best.line)
+    ) {
+      return `${best.line}, ${next.line}`;
+    }
+    return best.line;
+  }
+
+  // Nothing scored as address-like — fall back to the longest line as a
+  // reasonable guess, since the user can always edit it before adding.
+  return lines.reduce((a, b) => (b.length > a.length ? b : a));
+}
+
 const STATUS_COLORS: Record<StopStatus, string> = {
   pending: "#208AEF",
   completed: "#2ecc71",
@@ -172,11 +218,8 @@ export default function HomeScreen() {
       const photo = await cameraRef.current.takePictureAsync({ base64: false });
       if (photo?.uri) {
         const detectedLines = await extractTextFromImage(photo.uri);
-        // Join detected lines of text into one editable string — the user
-        // can clean it up before adding it as a stop, since OCR results
-        // aren't always perfectly formatted.
-        const joined = (detectedLines ?? []).join(", ");
-        setAddress(joined);
+        const bestGuess = extractAddressFromLines(detectedLines ?? []);
+        setAddress(bestGuess);
       }
     } catch (e) {
       console.log("Text scan error:", e);
